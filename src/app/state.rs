@@ -1418,6 +1418,9 @@ pub struct AppState {
     pub direct_attach_resize_locks: std::collections::HashSet<crate::terminal::TerminalId>,
     pub(crate) pane_id_aliases: std::collections::HashMap<u32, PaneId>,
     pub(crate) public_pane_id_aliases: std::collections::HashMap<String, PaneId>,
+    /// Session directory → pane anchors so shared-service agent reports keep
+    /// routing to the same pane after the pane's foreground cwd changes.
+    pub session_path_pane_anchors: std::collections::HashMap<String, PaneId>,
     pub workspaces: Vec<Workspace>,
     pub active: Option<usize>,
     pub(crate) previous_pane_focus: Option<PaneFocusTarget>,
@@ -1788,6 +1791,7 @@ impl AppState {
             direct_attach_resize_locks: std::collections::HashSet::new(),
             pane_id_aliases: std::collections::HashMap::new(),
             public_pane_id_aliases: std::collections::HashMap::new(),
+            session_path_pane_anchors: std::collections::HashMap::new(),
             workspaces: Vec::new(),
             active: None,
             previous_pane_focus: None,

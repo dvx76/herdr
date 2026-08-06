@@ -521,6 +521,7 @@ impl App {
             direct_attach_resize_locks: std::collections::HashSet::new(),
             pane_id_aliases: std::collections::HashMap::new(),
             public_pane_id_aliases: std::collections::HashMap::new(),
+            session_path_pane_anchors: std::collections::HashMap::new(),
             workspaces,
             active,
             previous_pane_focus: None,

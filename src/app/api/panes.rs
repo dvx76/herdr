@@ -27,6 +27,36 @@ use super::super::api_helpers::{
 use super::super::api_helpers::{METADATA_SOURCE_MAX_CHARS, METADATA_TTL_MAX_MS};
 use super::responses::{encode_error, encode_success};
 
+/// Resolves the pane whose foreground cwd matches a reported session
+/// directory, returning that pane's public id.
+///
+/// Exact cwd matches win over cwd-inside-path matches; within each class the
+/// first matching pane wins. A cwd is inside the path when it descends from it
+/// at a path-component boundary, so `/a/b` matches `/a/b/src` but not
+/// `/a/bc`. Trailing separators are ignored on both sides.
+fn resolve_pane_id_for_session_path<'a>(
+    path: &str,
+    panes: impl Iterator<Item = (&'a str, &'a str)>,
+) -> Option<String> {
+    let path = path.trim_end_matches(['/', '\\']);
+    let path = if path.is_empty() { "/" } else { path };
+    let mut inside_match = None;
+    for (pane_id, cwd) in panes {
+        let cwd = cwd.trim_end_matches(['/', '\\']);
+        let cwd = if cwd.is_empty() { "/" } else { cwd };
+        if cwd == path {
+            return Some(pane_id.to_string());
+        }
+        if let Some(remainder) = cwd.strip_prefix(path) {
+            if (remainder.starts_with('/') || remainder.starts_with('\\')) && inside_match.is_none()
+            {
+                inside_match = Some(pane_id.to_string());
+            }
+        }
+    }
+    inside_match
+}
+
 impl App {
     pub(super) fn handle_pane_split(&mut self, id: String, params: PaneSplitParams) -> String {
         let target = if let Some(target_pane_id) = params.target_pane_id.as_deref() {
@@ -1198,16 +1228,79 @@ impl App {
         )
     }
 
+    /// Routes a shared-service agent report to the pane whose foreground cwd
+    /// matches the reported session directory, falling back to the reported
+    /// pane id when the report carries no path or nothing matches.
+    ///
+    /// Anchored matches win so routing stays stable after the pane's foreground
+    /// cwd changes; stale anchors (pane gone) are dropped and re-resolved.
+    ///
+    /// The reported pane id is resolved by directory *before* it is validated:
+    /// opencode2's shared background service inherits the pane env of whichever
+    /// pane started it, so the id it reports can reference a pane that was
+    /// closed or moved since. Path routing must fix such reports up instead of
+    /// rejecting them at the door.
+    fn resolve_pane_for_session_path(
+        &mut self,
+        path: Option<&str>,
+        reported_pane_id: &str,
+    ) -> Option<(usize, PaneId)> {
+        let Some(path) = path else {
+            return self.parse_pane_id(reported_pane_id);
+        };
+        let path = path.trim_end_matches(['/', '\\']);
+        let path = if path.is_empty() { "/" } else { path };
+        if let Some(&anchored_pane_id) = self.state.session_path_pane_anchors.get(path) {
+            if let Some((ws_idx, _)) = self.find_pane(anchored_pane_id) {
+                return Some((ws_idx, anchored_pane_id));
+            }
+            self.state.session_path_pane_anchors.remove(path);
+        }
+        let mut candidates: Vec<(String, String)> = Vec::new();
+        for (ws_idx, ws) in self.state.workspaces.iter().enumerate() {
+            for tab in &ws.tabs {
+                let mut pane_ids: Vec<PaneId> = tab.panes.keys().copied().collect();
+                pane_ids.sort_by_key(|pane_id| pane_id.raw());
+                for pane_id in pane_ids {
+                    let Some(public_pane_id) = self.public_pane_id(ws_idx, pane_id) else {
+                        continue;
+                    };
+                    let Some(cwd) = tab.foreground_cwd_for_pane(pane_id, &self.terminal_runtimes)
+                    else {
+                        continue;
+                    };
+                    candidates.push((public_pane_id, cwd.display().to_string()));
+                }
+            }
+        }
+        if let Some(resolved_pane_id) = resolve_pane_id_for_session_path(
+            path,
+            candidates
+                .iter()
+                .map(|(pane_id, cwd)| (pane_id.as_str(), cwd.as_str())),
+        ) {
+            if let Some((ws_idx, pane_id)) = self.parse_pane_id(&resolved_pane_id) {
+                self.state
+                    .session_path_pane_anchors
+                    .insert(path.to_string(), pane_id);
+                return Some((ws_idx, pane_id));
+            }
+        }
+        self.parse_pane_id(reported_pane_id)
+    }
+
     pub(super) fn handle_pane_report_agent(
         &mut self,
         id: String,
         params: PaneReportAgentParams,
     ) -> String {
-        let Some((_ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
-            return pane_not_found(id, &params.pane_id);
-        };
         let Some(agent_label) = normalize_reported_agent_label(&params.agent) else {
             return invalid_agent(id);
+        };
+        let Some((_ws_idx, pane_id)) = self
+            .resolve_pane_for_session_path(params.agent_session_path.as_deref(), &params.pane_id)
+        else {
+            return pane_not_found(id, &params.pane_id);
         };
         self.handle_internal_event(crate::events::AppEvent::HookStateReported {
             pane_id,
@@ -1232,11 +1325,13 @@ impl App {
         id: String,
         params: PaneReportAgentSessionParams,
     ) -> String {
-        let Some((_ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
-            return pane_not_found(id, &params.pane_id);
-        };
         let Some(agent_label) = normalize_reported_agent_label(&params.agent) else {
             return invalid_agent(id);
+        };
+        let Some((_ws_idx, pane_id)) = self
+            .resolve_pane_for_session_path(params.agent_session_path.as_deref(), &params.pane_id)
+        else {
+            return pane_not_found(id, &params.pane_id);
         };
         self.handle_internal_event(crate::events::AppEvent::AgentSessionReported {
             pane_id,
@@ -4052,5 +4147,243 @@ mod tests {
 
             assert_eq!(metadata_error_code(&response), "invalid_metadata_ttl");
         }
+    }
+
+    #[test]
+    fn resolve_pane_id_for_session_path_matches_exact_cwd() {
+        let panes = [("ws1:p1", "/a/b"), ("ws1:p2", "/x/y")];
+        assert_eq!(
+            resolve_pane_id_for_session_path("/a/b", panes.into_iter()),
+            Some("ws1:p1".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_pane_id_for_session_path_matches_cwd_inside_path() {
+        let panes = [
+            ("ws1:p1", "/a/b"),
+            ("ws1:p2", "/a/b/src"),
+            ("ws1:p3", "/a/b/src/lib"),
+        ];
+        assert_eq!(
+            resolve_pane_id_for_session_path("/a/b", panes.into_iter()),
+            Some("ws1:p1".to_string())
+        );
+        let panes = [("ws1:p1", "/other"), ("ws1:p2", "/a/b/src")];
+        assert_eq!(
+            resolve_pane_id_for_session_path("/a/b", panes.into_iter()),
+            Some("ws1:p2".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_pane_id_for_session_path_rejects_non_component_boundary_prefix() {
+        let panes = [("ws1:p1", "/a/bc"), ("ws1:p2", "/a/bc/src")];
+        assert_eq!(
+            resolve_pane_id_for_session_path("/a/b", panes.into_iter()),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_pane_id_for_session_path_returns_none_without_match() {
+        let panes = [("ws1:p1", "/a/b"), ("ws1:p2", "/c/d")];
+        assert_eq!(
+            resolve_pane_id_for_session_path("/x/y", panes.into_iter()),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_pane_id_for_session_path_prefers_exact_match_over_inside_match() {
+        let panes = [("ws1:p1", "/a/b/src"), ("ws1:p2", "/a/b")];
+        assert_eq!(
+            resolve_pane_id_for_session_path("/a/b", panes.into_iter()),
+            Some("ws1:p2".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_pane_id_for_session_path_normalizes_trailing_separators() {
+        let panes = [("ws1:p1", "/a/b/"), ("ws1:p2", "/a/b//")];
+        assert_eq!(
+            resolve_pane_id_for_session_path("/a/b/", panes.into_iter()),
+            Some("ws1:p1".to_string())
+        );
+        let panes = [("ws1:p1", "/a/b/src/")];
+        assert_eq!(
+            resolve_pane_id_for_session_path("/a/b", panes.into_iter()),
+            Some("ws1:p1".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_pane_id_for_session_path_matches_windows_separators() {
+        let panes = [("ws1:p1", "C:\\proj\\src"), ("ws1:p2", "C:\\proj2")];
+        assert_eq!(
+            resolve_pane_id_for_session_path("C:\\proj", panes.into_iter()),
+            Some("ws1:p1".to_string())
+        );
+        assert_eq!(
+            resolve_pane_id_for_session_path("C:\\proj", [("ws1:p1", "C:\\proj2")].into_iter()),
+            None
+        );
+    }
+
+    #[test]
+    fn report_agent_rejects_stale_reported_pane_without_matching_path() {
+        let (mut app, _) = app_with_test_workspace();
+        let stale_pane_id = "w9:pZ".to_string();
+
+        let response = app.handle_pane_report_agent(
+            "req".into(),
+            PaneReportAgentParams {
+                pane_id: stale_pane_id.clone(),
+                source: "herdr:opencode".into(),
+                agent: "opencode".into(),
+                state: crate::api::schema::PaneAgentState::Working,
+                message: None,
+                seq: Some(1),
+                agent_session_id: Some("ses-test".into()),
+                agent_session_path: None,
+            },
+        );
+        assert!(response.contains("pane_not_found"));
+
+        let response = app.handle_pane_report_agent(
+            "req".into(),
+            PaneReportAgentParams {
+                pane_id: stale_pane_id,
+                source: "herdr:opencode".into(),
+                agent: "opencode".into(),
+                state: crate::api::schema::PaneAgentState::Working,
+                message: None,
+                seq: Some(2),
+                agent_session_id: Some("ses-test".into()),
+                agent_session_path: Some("/work/proj".into()),
+            },
+        );
+        assert!(response.contains("pane_not_found"));
+    }
+
+    #[test]
+    fn report_agent_routes_stale_reported_pane_by_anchored_session_path() {
+        let (mut app, public_pane_id) = app_with_test_workspace();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_detected_state(Some(crate::detect::Agent::OpenCode), AgentState::Idle);
+        app.state
+            .session_path_pane_anchors
+            .insert("/work/proj".into(), pane_id);
+
+        let stale_pane_id = "w9:pZ".to_string();
+        let session_params = PaneReportAgentSessionParams {
+            pane_id: stale_pane_id.clone(),
+            source: "herdr:opencode".into(),
+            agent: "opencode".into(),
+            seq: Some(1),
+            agent_session_id: Some("ses-test".into()),
+            agent_session_path: Some("/work/proj".into()),
+            session_start_source: Some("new".into()),
+        };
+        let response = app.handle_pane_report_agent_session("req".into(), session_params);
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(success.result, ResponseResult::Ok { .. }));
+
+        let response = app.handle_pane_report_agent(
+            "req".into(),
+            PaneReportAgentParams {
+                pane_id: stale_pane_id,
+                source: "herdr:opencode".into(),
+                agent: "opencode".into(),
+                state: crate::api::schema::PaneAgentState::Working,
+                message: None,
+                seq: Some(2),
+                agent_session_id: Some("ses-test".into()),
+                agent_session_path: Some("/work/proj".into()),
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(success.result, ResponseResult::Ok { .. }));
+
+        let response = app.handle_pane_get(
+            "req".into(),
+            crate::api::schema::PaneTarget {
+                pane_id: public_pane_id,
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::PaneInfo { pane } = success.result else {
+            panic!("expected pane info response");
+        };
+        assert_eq!(pane.agent.as_deref(), Some("opencode"));
+        assert_eq!(pane.agent_status, crate::api::schema::AgentStatus::Working);
+        assert!(app
+            .state
+            .session_path_pane_anchors
+            .contains_key("/work/proj"));
+    }
+
+    #[test]
+    fn report_agent_keeps_plain_reported_pane_routing_when_path_matches_nothing() {
+        let (mut app, public_pane_id) = app_with_test_workspace();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_detected_state(Some(crate::detect::Agent::OpenCode), AgentState::Idle);
+
+        let response = app.handle_pane_report_agent_session(
+            "req".into(),
+            PaneReportAgentSessionParams {
+                pane_id: public_pane_id.clone(),
+                source: "herdr:opencode".into(),
+                agent: "opencode".into(),
+                seq: Some(1),
+                agent_session_id: Some("ses-test".into()),
+                agent_session_path: Some("/work/proj".into()),
+                session_start_source: Some("new".into()),
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(success.result, ResponseResult::Ok { .. }));
+
+        let response = app.handle_pane_report_agent(
+            "req".into(),
+            PaneReportAgentParams {
+                pane_id: public_pane_id.clone(),
+                source: "herdr:opencode".into(),
+                agent: "opencode".into(),
+                state: crate::api::schema::PaneAgentState::Working,
+                message: None,
+                seq: Some(2),
+                agent_session_id: Some("ses-test".into()),
+                agent_session_path: Some("/work/proj".into()),
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(success.result, ResponseResult::Ok { .. }));
+
+        let response = app.handle_pane_get(
+            "req".into(),
+            crate::api::schema::PaneTarget {
+                pane_id: public_pane_id,
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::PaneInfo { pane } = success.result else {
+            panic!("expected pane info response");
+        };
+        assert_eq!(pane.agent_status, crate::api::schema::AgentStatus::Working);
     }
 }

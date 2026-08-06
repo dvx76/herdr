@@ -421,6 +421,11 @@ impl TerminalState {
                         &authority.source,
                         &authority.agent_label,
                     ) && crate::detect::parse_agent_label(&authority.agent_label) == agent
+                        // A state-only projection carries no session and must
+                        // not become the process-exit gate; the pane's real
+                        // session (persisted below) has to survive for the
+                        // same-session re-anchor path.
+                        && authority.session_ref.is_some()
                 })
                 .map(|authority| {
                     (
@@ -671,6 +676,18 @@ impl TerminalState {
         let previous_state = self.state;
         let previous_presentation = self.effective_presentation_for_state_at(previous_state, now);
         let previous_session = self.current_session_identity_for_persistence();
+        // A state-only projection carries no session ref and must not destroy
+        // the pane's session identity: keep the previous authority's ref for
+        // the same source/agent so the anchor survives the projection and
+        // later session-bound reports still match it instead of being rejected
+        // as unanchored cross-talk.
+        let session_ref = session_ref.or_else(|| {
+            self.hook_authority.as_ref().and_then(|authority| {
+                (authority.source == source && authority.agent_label == agent_label)
+                    .then(|| authority.session_ref.clone())
+                    .flatten()
+            })
+        });
         self.reconcile_agent_name_owner(&agent_label, session_ref.as_ref());
         if foreground_takeover_allowed {
             self.suppress_current_full_lifecycle_hook_authority(
@@ -688,7 +705,11 @@ impl TerminalState {
                 }
             }
         }
-        self.persisted_agent_session = None;
+        // A state-only projection carries no session ref and must not destroy
+        // the pane's session identity; only session-bound reports replace it.
+        if session_ref.is_some() {
+            self.persisted_agent_session = None;
+        }
         self.hook_authority = Some(HookAuthority {
             source,
             agent_label,
@@ -905,6 +926,25 @@ impl TerminalState {
             .hook_report_sequences
             .get(source)
             .is_some_and(|previous| seq <= *previous)
+        {
+            return FullLifecycleHookReportRoute::Ignore;
+        }
+
+        // A session-bound report that does not match an already-anchored
+        // session while the pane's process is still alive is shared-service
+        // cross-talk (concurrent sessions in the same directory), not a
+        // process exit. Buffering it as a replacement would gate every later
+        // report for this source and freeze the pane on the last accepted
+        // state until a process exit or a fresh session report; a pending
+        // report can only be applied on re-detection anyway, so only buffer
+        // when no session is anchored yet (the pane may still be replaying
+        // its own session), when the process is actually gone, or when a gate
+        // already exists.
+        if process_present
+            && !self
+                .suppressed_full_lifecycle_hook_reports
+                .contains_key(source)
+            && self.current_session_identity_for_persistence().is_some()
         {
             return FullLifecycleHookReportRoute::Ignore;
         }
@@ -1341,12 +1381,27 @@ impl TerminalState {
                 suppressed.agent_label == agent_label
                     && suppressed.reason != FullLifecycleHookSuppressionReason::HookClear
             });
+        // The pane's own session re-asserting after its process exited and was
+        // re-detected (e.g. the opencode2 TUI relaunching and resuming the same
+        // session) is legitimate re-anchor evidence; a *different* session must
+        // still wait for fresh process evidence and a recognized start source.
+        let same_gated_session = self
+            .suppressed_full_lifecycle_hook_reports
+            .get(&source)
+            .is_some_and(|suppressed| {
+                suppressed.agent_label == agent_label
+                    && suppressed.session_ref.as_ref() == Some(&session_ref)
+            });
         let session_anchored = self.hook_authority.as_ref().is_some_and(|authority| {
             authority.source == source
                 && authority.agent_label == agent_label
                 && authority.session_ref.is_some()
         }) || self.persisted_agent_session_matches(&source, &agent_label);
-        if full_lifecycle_source && (!process_present || generation_gated || !session_anchored) {
+        if full_lifecycle_source
+            && (!process_present
+                || (generation_gated && !same_gated_session)
+                || (!session_anchored && !same_gated_session))
+        {
             if !Self::session_start_source_is_recognized(session_start_source.as_deref()) {
                 return None;
             }
@@ -1488,6 +1543,11 @@ impl TerminalState {
             self.hook_authority = None;
         }
         self.reconcile_agent_name_owner(&agent_label, Some(&session_ref));
+        if same_gated_session {
+            // The pane's own session re-anchored after its process relaunch;
+            // drop the process-exit gate so state reports flow again.
+            self.suppressed_full_lifecycle_hook_reports.remove(&source);
+        }
         self.persisted_agent_session = Some(crate::agent_resume::PersistedAgentSession {
             source,
             agent: agent_label,
@@ -4248,7 +4308,7 @@ mod tests {
     }
 
     #[test]
-    fn accepted_hook_report_without_session_ref_clears_previous_ref() {
+    fn accepted_hook_report_without_session_ref_keeps_previous_ref() {
         let mut terminal = test_terminal();
         let session_path = test_session_path("pi.jsonl");
         anchor_full_lifecycle_session(
@@ -4263,7 +4323,7 @@ mod tests {
             "pi".into(),
             AgentState::Working,
             None,
-            crate::agent_resume::AgentSessionRef::path(session_path),
+            crate::agent_resume::AgentSessionRef::path(session_path.clone()),
             Some(20),
         );
 
@@ -4271,21 +4331,26 @@ mod tests {
             .set_hook_authority_with_session_ref(
                 "herdr:pi".into(),
                 "pi".into(),
-                AgentState::Working,
+                AgentState::Blocked,
                 None,
                 None,
                 Some(21),
             )
             .expect("accepted report");
 
-        assert!(mutation.session_ref_changed);
-        assert!(mutation.effective_state_change.is_none());
-        assert!(terminal
-            .hook_authority
-            .as_ref()
-            .unwrap()
-            .session_ref
-            .is_none());
+        assert!(!mutation.session_ref_changed);
+        assert_eq!(terminal.state, AgentState::Blocked);
+        assert_eq!(
+            terminal
+                .hook_authority
+                .as_ref()
+                .unwrap()
+                .session_ref
+                .as_ref()
+                .map(|session_ref| session_ref.value.as_str()),
+            Some(session_path.as_str()),
+            "a state-only report must not drop the pane's session identity"
+        );
     }
 
     #[test]
@@ -5421,6 +5486,277 @@ mod tests {
         assert!(change.is_none());
         assert_eq!(terminal.state, AgentState::Working);
         assert!(terminal.hook_authority.is_some());
+    }
+
+    #[test]
+    fn same_session_reasserts_after_process_exit_reanchors_authority() {
+        let mut terminal = test_terminal();
+        let session = test_session_path("same-session-after-process-exit.jsonl");
+        let now = Instant::now();
+        terminal.set_detected_state(Some(Agent::OpenCode), AgentState::Idle);
+        terminal
+            .set_agent_session_ref_for_session_start(
+                "herdr:opencode".into(),
+                "opencode".into(),
+                crate::agent_resume::AgentSessionRef::path(session.clone()),
+                Some(1000),
+                Some("startup".into()),
+            )
+            .expect("initial session start should anchor");
+        terminal.set_hook_authority_at(
+            "herdr:opencode".into(),
+            "opencode".into(),
+            AgentState::Blocked,
+            None,
+            None,
+            Some(1001),
+            now,
+        );
+        assert_eq!(terminal.state, AgentState::Blocked);
+
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::OpenCode),
+            AgentState::Idle,
+            false,
+            true,
+            false,
+            true,
+            now + Duration::from_millis(1),
+        );
+
+        let while_gone = terminal.set_agent_session_ref_for_session_start(
+            "herdr:opencode".into(),
+            "opencode".into(),
+            crate::agent_resume::AgentSessionRef::path(session.clone()),
+            Some(1002),
+            None,
+        );
+        assert!(
+            while_gone.is_none(),
+            "no re-anchor while the process is gone"
+        );
+
+        terminal.set_detected_state_with_screen_signals_at(
+            None,
+            AgentState::Unknown,
+            false,
+            false,
+            false,
+            false,
+            now + Duration::from_millis(3),
+        );
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::OpenCode),
+            AgentState::Unknown,
+            false,
+            false,
+            false,
+            false,
+            now + Duration::from_millis(4),
+        );
+
+        let reanchored = terminal.set_agent_session_ref_for_session_start(
+            "herdr:opencode".into(),
+            "opencode".into(),
+            crate::agent_resume::AgentSessionRef::path(session.clone()),
+            Some(1003),
+            None,
+        );
+        assert!(
+            reanchored.is_some(),
+            "the pane's own session should re-anchor on a fresh process"
+        );
+
+        let state_report = terminal.set_hook_authority_with_session_ref(
+            "herdr:opencode".into(),
+            "opencode".into(),
+            AgentState::Working,
+            None,
+            crate::agent_resume::AgentSessionRef::path(session),
+            Some(1004),
+        );
+        assert!(state_report.is_some(), "state reports flow after re-anchor");
+        assert_eq!(terminal.state, AgentState::Working);
+    }
+
+    #[test]
+    fn state_only_projection_preserves_session_anchor() {
+        let mut terminal = test_terminal();
+        let session = test_session_path("projection-preserves-anchor.jsonl");
+        terminal.set_detected_state(Some(Agent::OpenCode), AgentState::Idle);
+        terminal
+            .set_agent_session_ref_for_session_start(
+                "herdr:opencode".into(),
+                "opencode".into(),
+                crate::agent_resume::AgentSessionRef::path(session.clone()),
+                Some(1000),
+                Some("startup".into()),
+            )
+            .expect("initial session start should anchor");
+
+        // A session-bound state report moves the anchor from the persisted
+        // session into the hook authority.
+        let working = terminal.set_hook_authority_with_session_ref(
+            "herdr:opencode".into(),
+            "opencode".into(),
+            AgentState::Working,
+            None,
+            crate::agent_resume::AgentSessionRef::path(session.clone()),
+            Some(1001),
+        );
+        assert!(working.is_some());
+        assert_eq!(terminal.state, AgentState::Working);
+
+        // The state-only projection must keep the pane's session identity.
+        let blocked = terminal.set_hook_authority_with_session_ref(
+            "herdr:opencode".into(),
+            "opencode".into(),
+            AgentState::Blocked,
+            None,
+            None,
+            Some(1002),
+        );
+        assert!(blocked.is_some());
+        assert_eq!(terminal.state, AgentState::Blocked);
+        assert_eq!(
+            terminal
+                .current_session_identity_for_persistence()
+                .map(|(_, _, _, value)| value),
+            Some(session.clone()),
+            "the projection must not drop the pane's session identity"
+        );
+
+        // The turn-end report for the same session still lands afterwards.
+        let idle = terminal.set_hook_authority_with_session_ref(
+            "herdr:opencode".into(),
+            "opencode".into(),
+            AgentState::Idle,
+            None,
+            crate::agent_resume::AgentSessionRef::path(session),
+            Some(1003),
+        );
+        assert!(
+            idle.is_some(),
+            "session-bound reports must flow after a state-only projection"
+        );
+        assert_eq!(terminal.state, AgentState::Idle);
+    }
+
+    #[test]
+    fn rejected_cross_session_report_on_live_process_does_not_gate_the_pane() {
+        let mut terminal = test_terminal();
+        let anchored = test_session_path("anchored-cross-talk-session.jsonl");
+        let other = test_session_path("other-cross-talk-session.jsonl");
+        terminal.set_detected_state(Some(Agent::OpenCode), AgentState::Idle);
+        terminal
+            .set_agent_session_ref_for_session_start(
+                "herdr:opencode".into(),
+                "opencode".into(),
+                crate::agent_resume::AgentSessionRef::path(anchored.clone()),
+                Some(1000),
+                Some("startup".into()),
+            )
+            .expect("initial session start should anchor");
+
+        // A report for a different session while the process is alive is
+        // shared-service cross-talk, not a process exit.
+        let rejected = terminal.set_hook_authority_with_session_ref(
+            "herdr:opencode".into(),
+            "opencode".into(),
+            AgentState::Working,
+            None,
+            crate::agent_resume::AgentSessionRef::path(other),
+            Some(1001),
+        );
+        assert!(rejected.is_none());
+        assert!(
+            terminal
+                .suppressed_full_lifecycle_hook_reports
+                .get("herdr:opencode")
+                .is_none(),
+            "cross-session reports must not create the process-exit gate"
+        );
+
+        // The anchored session's reports keep flowing.
+        let accepted = terminal.set_hook_authority_with_session_ref(
+            "herdr:opencode".into(),
+            "opencode".into(),
+            AgentState::Idle,
+            None,
+            crate::agent_resume::AgentSessionRef::path(anchored),
+            Some(1002),
+        );
+        assert!(
+            accepted.is_some(),
+            "the anchored session's reports must still land after cross-talk"
+        );
+        assert_eq!(terminal.state, AgentState::Idle);
+    }
+
+    #[test]
+    fn different_session_after_process_exit_still_waits_for_start_source() {
+        let mut terminal = test_terminal();
+        let old_session = test_session_path("old-before-different-reassert.jsonl");
+        let other_session = test_session_path("other-after-process-exit.jsonl");
+        let now = Instant::now();
+        terminal.set_detected_state(Some(Agent::OpenCode), AgentState::Idle);
+        terminal
+            .set_agent_session_ref_for_session_start(
+                "herdr:opencode".into(),
+                "opencode".into(),
+                crate::agent_resume::AgentSessionRef::path(old_session),
+                Some(1000),
+                Some("startup".into()),
+            )
+            .expect("initial session start should anchor");
+
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::OpenCode),
+            AgentState::Idle,
+            false,
+            true,
+            false,
+            true,
+            now + Duration::from_millis(1),
+        );
+        terminal.set_detected_state_with_screen_signals_at(
+            None,
+            AgentState::Unknown,
+            false,
+            false,
+            false,
+            false,
+            now + Duration::from_millis(3),
+        );
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::OpenCode),
+            AgentState::Unknown,
+            false,
+            false,
+            false,
+            false,
+            now + Duration::from_millis(4),
+        );
+
+        let other = terminal.set_agent_session_ref_for_session_start(
+            "herdr:opencode".into(),
+            "opencode".into(),
+            crate::agent_resume::AgentSessionRef::path(other_session.clone()),
+            Some(1002),
+            None,
+        );
+        assert!(
+            other.is_none(),
+            "a different session still needs a recognized start source"
+        );
+        let other_with_start = terminal.set_agent_session_ref_for_session_start(
+            "herdr:opencode".into(),
+            "opencode".into(),
+            crate::agent_resume::AgentSessionRef::path(other_session),
+            Some(1003),
+            Some("new".into()),
+        );
+        assert!(other_with_start.is_some());
     }
 
     #[test]
