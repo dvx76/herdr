@@ -39,6 +39,7 @@ pub(crate) fn render_client_overlay(
     s: &ClientShellSnapshot,
     endpoints: &[ClientShellEndpoint],
     active_endpoint_id: &ClientEndpointId,
+    agent_panel_sort: crate::config::AgentPanelSortConfig,
     k: &LiveKeybindConfig,
     p: &Palette,
 ) -> Option<OverlayRender> {
@@ -65,7 +66,7 @@ pub(crate) fn render_client_overlay(
         ClientShellOverlay::ConfirmClose(v) => render_confirm_close_overlay(b, v, p),
         ClientShellOverlay::Help(v) => render_help_overlay(b, v, k, p),
         ClientShellOverlay::Navigator(v) => {
-            render_navigator_overlay(b, v, endpoints, active_endpoint_id, p)
+            render_navigator_overlay(b, v, endpoints, active_endpoint_id, agent_panel_sort, p)
         }
         ClientShellOverlay::Settings(v) => {
             settings_overlay::render_settings_overlay(b, v, s.integration_updates_available, p)
@@ -706,6 +707,7 @@ fn render_navigator_overlay(
     n: &ClientNavigatorOverlay,
     endpoints: &[ClientShellEndpoint],
     active_endpoint_id: &ClientEndpointId,
+    agent_panel_sort: crate::config::AgentPanelSortConfig,
     p: &Palette,
 ) -> Option<OverlayRender> {
     let a = b.area;
@@ -730,35 +732,49 @@ fn render_navigator_overlay(
         " Go to ",
         Style::default().fg(p.accent).bg(p.panel_bg),
     );
-    let rows = super::aggregate_navigation::navigator_rows(endpoints, active_endpoint_id, n);
+    let rows = super::aggregate_navigation::navigator_rows(
+        endpoints,
+        active_endpoint_id,
+        n,
+        agent_panel_sort,
+    );
+    let agent_picker = n.mode == ClientNavigatorMode::AgentPicker;
     let search = if n.search_focused {
         " / ".to_owned()
-    } else if let Some(f) = n.filter {
-        format!(
-            " / {}",
-            match f {
-                ClientNavigatorFilter::Blocked => "blocked",
-                ClientNavigatorFilter::Working => "working",
-                ClientNavigatorFilter::Idle => "idle",
-                ClientNavigatorFilter::Done => "done",
+    } else if agent_picker {
+        if !n.query.is_empty() {
+            format!(" / {}", n.query)
+        } else {
+            // The same view label the agent sidebar shows for the active machine.
+            let view_label = endpoints
+                .iter()
+                .find(|endpoint| &endpoint.endpoint_id == active_endpoint_id)
+                .and_then(|endpoint| endpoint.snapshot.as_deref())
+                .and_then(|snapshot| snapshot.agent_view_label.as_deref());
+            let mut parts = vec!["agents"];
+            parts.extend(view_label);
+            parts.extend(n.filter.map(ClientNavigatorFilter::label));
+            if parts.len() == 1 {
+                " / search agents".to_owned()
+            } else {
+                format!(" / {}", parts.join(" · "))
             }
-        )
+        }
+    } else if let Some(f) = n.filter {
+        format!(" / {}", f.label())
     } else if n.query.is_empty() {
         " / search agents and terminals".to_owned()
     } else {
         format!(" / {}", n.query)
     };
-    let terminal_count = rows
+    let pane_count = rows
         .iter()
         .filter(|row| matches!(row.target, ClientNavigatorTarget::Pane { .. }))
         .count();
     let count = format!(
-        "{terminal_count} {}",
-        if terminal_count == 1 {
-            "terminal"
-        } else {
-            "terminals"
-        }
+        "{pane_count} {}{}",
+        if agent_picker { "agent" } else { "terminal" },
+        if pane_count == 1 { "" } else { "s" }
     );
     put_text(
         b,
@@ -823,7 +839,13 @@ fn render_navigator_overlay(
             body.x,
             body.y,
             body.width,
-            " No matching agents or terminals",
+            if !agent_picker {
+                " No matching agents or terminals"
+            } else if n.filter.is_some() || !n.query.trim().is_empty() {
+                " No matching agents"
+            } else {
+                " No agents"
+            },
             Style::default().fg(p.overlay0).bg(p.panel_bg),
         );
     }
@@ -861,7 +883,10 @@ fn render_navigator_overlay(
                 .bg(p.panel_bg)
         };
         let is_pane = matches!(r.target, ClientNavigatorTarget::Pane { .. });
-        let connector = if !is_pane {
+        // The agent picker is flat: tree connectors would hang below nothing,
+        // and the ◆ current marker has no column of its own, so both stay
+        // tree-only.
+        let connector = if !is_pane || agent_picker {
             ""
         } else if rows
             .get(ix + 1)
@@ -874,7 +899,11 @@ fn render_navigator_overlay(
         let padding = u16::from(r.depth.saturating_sub(u8::from(is_pane))) * 2 + 1;
         let connector_x = rect.x + padding;
         let indent = format!("{:width$}{connector}", "", width = usize::from(padding));
-        let current = if r.current { "◆ " } else { "" };
+        let current = if r.current && !agent_picker {
+            "◆ "
+        } else {
+            ""
+        };
         let status = r.status.map(status_dot).unwrap_or_default();
         let status_separator = if status.is_empty() { "" } else { " " };
         let label = format!("{indent}{current}{status}{status_separator}{}", r.label);
@@ -1028,6 +1057,9 @@ fn render_navigator_overlay(
         i.width,
         if n.search_focused {
             " search type · move ↑↓/ctrl+n/p · open enter · back esc"
+        } else if agent_picker {
+            // The flat agent picker has no workspace sections for ←→ to jump between.
+            " ↑↓/j/k rows · / search · a/b/w/i/d filter · enter open · esc close"
         } else {
             " ↑↓/j/k rows · ←→ workspace · / search · a/b/w/i/d filter · enter open · esc close"
         },

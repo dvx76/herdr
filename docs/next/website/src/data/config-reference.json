@@ -548,6 +548,12 @@
           "description": "Open the session navigator."
         },
         {
+          "key": "keys.agent_picker",
+          "type": "keybinding",
+          "default": "\"prefix+a\"",
+          "description": "Open the agent picker: every agent on every connected machine, flat and state-sorted."
+        },
+        {
           "key": "keys.navigate_workspace_up",
           "type": "keybinding",
           "default": "\"up\"",

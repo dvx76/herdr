@@ -58,11 +58,14 @@ Workspaces and session:
 | Rename workspace | `prefix+shift+w` |
 | Close workspace | `prefix+shift+d` |
 | Goto picker | `prefix+g` |
+| Agent picker | `prefix+a` |
 | Toggle sidebar | `prefix+b` |
 
 The full keymap and the binding syntax live in the [keybinding reference](/docs/configuration/#keybindings).
 
 The Goto picker (`prefix+g`) lists each agent or terminal on its own row, grouped by workspace. Split tabs never hide their panes behind another row. Click a row or press Enter to jump directly to it. Press `/` to search names, agent kinds, tabs, workspaces, branches, or paths; use Up/Down or `j/k` to move between rows when not typing a search. Left/Right jumps to the first agent or terminal in the previous/next workspace section, without wrapping. While editing a search, Left/Right moves the text cursor instead. Outside search, `b/w/i/d` filter blocked, working, idle, or done agents, and `a` shows all terminals again. The selected destination's location and path appear below the list. When the list overflows, use the mouse wheel, click the scrollbar track, or drag its thumb to scroll without opening a destination.
+
+The Agent picker (`prefix+a`) opens the same navigator as a flat list of every agent on every connected machine, ordered like the sidebar agent panel: it follows `ui.agent_panel_sort` and any active agent view, and agents on disconnected machines are dimmed and, with priority sort, listed last. When several machines are connected, each row starts with its machine name. The list opens on its first row. Press `/` to search agent and pane names, agent kinds, titles, machines, workspaces, branches, tabs, or paths; outside search, `b/w/i/d` filter by state and `a` shows all agents again. Enter jumps to the agent, switching machines when needed.
 
 Press Esc or Ctrl+[ to leave workspace navigation. In the Go To picker, `/` also opens search on layouts that require Shift to type it.
 

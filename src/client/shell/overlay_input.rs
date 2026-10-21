@@ -191,19 +191,36 @@ impl ClientShellState {
     }
 
     pub(super) fn open_navigator_overlay(&mut self) {
+        self.open_navigator_overlay_with_mode(ClientNavigatorMode::Tree);
+    }
+
+    pub(super) fn open_agent_picker_overlay(&mut self) {
+        self.open_navigator_overlay_with_mode(ClientNavigatorMode::AgentPicker);
+    }
+
+    fn open_navigator_overlay_with_mode(&mut self, mode: ClientNavigatorMode) {
         let mut navigator = ClientNavigatorOverlay {
             query: TextEditor::default(),
             search_focused: false,
             selected: None,
             scroll: 0,
             filter: None,
+            mode,
         };
-        let rows =
-            render::client_navigator_rows(&self.endpoints, &self.active_endpoint_id, &navigator);
-        navigator.selected = rows
-            .iter()
-            .find(|row| row.current)
-            .map(|row| row.target.clone());
+        let rows = render::client_navigator_rows(
+            &self.endpoints,
+            &self.active_endpoint_id,
+            &navigator,
+            self.config.agent_panel_sort,
+        );
+        navigator.selected = match mode {
+            ClientNavigatorMode::Tree => rows.iter().find(|row| row.current),
+            // The agent picker opens on its first row, rather than on the
+            // focused pane: the top agent under priority sort, or the first
+            // agent in space order otherwise.
+            ClientNavigatorMode::AgentPicker => rows.first(),
+        }
+        .map(|row| row.target.clone());
         self.overlay = Some(ClientShellOverlay::Navigator(navigator));
     }
 
@@ -211,8 +228,12 @@ impl ClientShellState {
         let Some(ClientShellOverlay::Navigator(navigator)) = self.overlay.as_mut() else {
             return;
         };
-        let rows =
-            render::client_navigator_rows(&self.endpoints, &self.active_endpoint_id, navigator);
+        let rows = render::client_navigator_rows(
+            &self.endpoints,
+            &self.active_endpoint_id,
+            navigator,
+            self.config.agent_panel_sort,
+        );
         if rows.is_empty() {
             navigator.selected = None;
             return;
@@ -228,8 +249,12 @@ impl ClientShellState {
         let Some(ClientShellOverlay::Navigator(navigator)) = self.overlay.as_mut() else {
             return;
         };
-        let rows =
-            render::client_navigator_rows(&self.endpoints, &self.active_endpoint_id, navigator);
+        let rows = render::client_navigator_rows(
+            &self.endpoints,
+            &self.active_endpoint_id,
+            navigator,
+            self.config.agent_panel_sort,
+        );
         let viewport_rows = viewport_rows.max(1);
         navigator.scroll = scroll.min(rows.len().saturating_sub(viewport_rows));
         let selected =
@@ -243,8 +268,12 @@ impl ClientShellState {
         let Some(ClientShellOverlay::Navigator(navigator)) = self.overlay.as_mut() else {
             return;
         };
-        let rows =
-            render::client_navigator_rows(&self.endpoints, &self.active_endpoint_id, navigator);
+        let rows = render::client_navigator_rows(
+            &self.endpoints,
+            &self.active_endpoint_id,
+            navigator,
+            self.config.agent_panel_sort,
+        );
         let Some(selected) =
             super::aggregate_navigation::navigator_selected_index(&rows, navigator)
         else {
@@ -280,6 +309,7 @@ impl ClientShellState {
                     &self.endpoints,
                     &self.active_endpoint_id,
                     navigator,
+                    self.config.agent_panel_sort,
                 );
                 super::aggregate_navigation::selected_navigator_target(&rows, navigator)
             }
@@ -707,6 +737,7 @@ impl ClientShellState {
                         &self.endpoints,
                         &self.active_endpoint_id,
                         navigator,
+                        self.config.agent_panel_sort,
                     )
                     .last()
                     .map(|row| row.target.clone()),

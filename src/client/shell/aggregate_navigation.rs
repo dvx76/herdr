@@ -1,7 +1,7 @@
 //! Endpoint-qualified rows shared by aggregate navigation surfaces.
 
 use super::*;
-use crate::protocol::ClientShellAgent;
+use crate::protocol::{ClientShellAgent, ClientShellPane, ClientShellTab, ClientShellWorkspace};
 
 #[derive(Clone, Copy)]
 pub(super) struct CachedEndpointSnapshot<'a> {
@@ -279,23 +279,15 @@ pub(super) fn navigator_rows(
     endpoints: &[ClientShellEndpoint],
     active_endpoint_id: &ClientEndpointId,
     navigator: &ClientNavigatorOverlay,
+    sort: crate::config::AgentPanelSortConfig,
 ) -> Vec<ClientNavigatorRow> {
+    if navigator.mode == ClientNavigatorMode::AgentPicker {
+        return agent_picker_rows(endpoints, active_endpoint_id, navigator, sort);
+    }
     let query = navigator.query.trim().to_lowercase();
-    let filter = |status| match navigator.filter {
-        Some(ClientNavigatorFilter::Blocked) => status == crate::api::schema::AgentStatus::Blocked,
-        Some(ClientNavigatorFilter::Working) => status == crate::api::schema::AgentStatus::Working,
-        Some(ClientNavigatorFilter::Idle) => status == crate::api::schema::AgentStatus::Idle,
-        Some(ClientNavigatorFilter::Done) => status == crate::api::schema::AgentStatus::Done,
-        None => true,
-    };
+    let filter = |status| ClientNavigatorFilter::matches(navigator.filter, status);
     let words = query.split_whitespace().collect::<Vec<_>>();
-    let text = |value: &str| {
-        if words.is_empty() {
-            return true;
-        }
-        let value = value.to_lowercase();
-        words.iter().all(|word| value.contains(word))
-    };
+    let text = |value: &str| query_words_match(&words, value);
     let filtering = navigator.filter.is_some() || !query.is_empty();
     let federated = endpoints.len() > 1;
     let depth_offset = u8::from(federated);
@@ -462,6 +454,148 @@ pub(super) fn navigator_rows(
         }
     }
     rows
+}
+
+fn agent_picker_rows(
+    endpoints: &[ClientShellEndpoint],
+    active_endpoint_id: &ClientEndpointId,
+    navigator: &ClientNavigatorOverlay,
+    sort: crate::config::AgentPanelSortConfig,
+) -> Vec<ClientNavigatorRow> {
+    let query = navigator.query.trim().to_lowercase();
+    let words = query.split_whitespace().collect::<Vec<_>>();
+    let text = |value: &str| query_words_match(&words, value);
+    let federated = endpoints.len() > 1;
+    let candidates = aggregate_agent_rows(endpoints, active_endpoint_id, sort);
+    // Keep the machine prefix in its own column: pad shorter machine labels to
+    // the widest one in the candidate set so the `·` separators line up. The
+    // width comes from the candidates before the status filter and query, so
+    // the column does not jump while typing or filtering.
+    let machine_width = if federated {
+        candidates
+            .iter()
+            .map(|row| super::render::display_width(row.endpoint.label))
+            .max()
+            .unwrap_or_default()
+    } else {
+        0
+    };
+    // Endpoint-local indexes, built on first use so endpoints whose agents
+    // are all filtered out by status never pay for them.
+    let mut indexes = HashMap::<usize, NavigatorEndpointIndex<'_>>::new();
+    let mut rows = Vec::new();
+    for row in candidates {
+        let agent = row.agent;
+        if !ClientNavigatorFilter::matches(navigator.filter, agent.agent_status) {
+            continue;
+        }
+        let index = indexes
+            .entry(row.endpoint.endpoint_index)
+            .or_insert_with(|| NavigatorEndpointIndex::new(row.endpoint.snapshot));
+        let pane = index.panes.get(agent.pane_id.as_str()).copied();
+        let workspace = index.workspaces.get(agent.workspace_id.as_str()).copied();
+        let tab = index.tabs.get(agent.tab_id.as_str()).copied();
+        let cwd = pane.and_then(|pane| pane.foreground_cwd.as_deref().or(pane.cwd.as_deref()));
+        let pane_label = pane.and_then(|pane| pane.label.as_deref());
+        let agent_label = pane_label
+            .or(agent.name.as_deref())
+            .or(agent.title.as_deref())
+            .or(agent.terminal_title_stripped.as_deref())
+            .or(agent.display_agent.as_deref())
+            .or(agent.agent.as_deref())
+            .unwrap_or(agent.pane_id.as_str());
+        let label = if federated {
+            let pad = usize::from(machine_width).saturating_sub(usize::from(
+                super::render::display_width(row.endpoint.label),
+            ));
+            format!("{}{} · {agent_label}", row.endpoint.label, " ".repeat(pad))
+        } else {
+            agent_label.to_owned()
+        };
+        let query_matches = text(row.endpoint.label)
+            || text(&label)
+            || pane_label.is_some_and(text)
+            || agent.name.as_deref().is_some_and(text)
+            || agent.display_agent.as_deref().is_some_and(text)
+            || agent.agent.as_deref().is_some_and(text)
+            || agent.title.as_deref().is_some_and(text)
+            || agent.terminal_title_stripped.as_deref().is_some_and(text)
+            || workspace.is_some_and(|workspace| {
+                text(&workspace.label) || workspace.branch.as_deref().is_some_and(text)
+            })
+            || tab.is_some_and(|tab| text(&tab.label))
+            || cwd.is_some_and(text)
+            || text(&agent.pane_id);
+        if !query_matches {
+            continue;
+        }
+        let workspace_label = workspace
+            .map(|workspace| workspace.label.as_str())
+            .unwrap_or(agent.workspace_id.as_str());
+        let tab_label = tab
+            .map(|tab| tab.label.as_str())
+            .unwrap_or(agent.tab_id.as_str());
+        rows.push(ClientNavigatorRow {
+            depth: 0,
+            label,
+            meta: cwd.unwrap_or_default().to_owned(),
+            detail: format!(
+                "{} / {} / {} / {}",
+                row.endpoint.label, workspace_label, tab_label, agent.pane_id
+            ),
+            agent: agent
+                .display_agent
+                .as_deref()
+                .or(agent.agent.as_deref())
+                .map(str::to_owned),
+            status: Some(agent.agent_status),
+            stale: row.endpoint.stale(),
+            current: *row.endpoint.endpoint_id == *active_endpoint_id
+                && row.endpoint.snapshot.focused_pane_id.as_deref() == Some(&agent.pane_id),
+            target: ClientNavigatorTarget::Pane {
+                endpoint_id: row.endpoint.endpoint_id.clone(),
+                pane_id: agent.pane_id.clone(),
+            },
+        });
+    }
+    rows
+}
+
+/// Whether `value` contains every lowercased query word. No words match all.
+fn query_words_match(words: &[&str], value: &str) -> bool {
+    if words.is_empty() {
+        return true;
+    }
+    let value = value.to_lowercase();
+    words.iter().all(|word| value.contains(word))
+}
+
+struct NavigatorEndpointIndex<'a> {
+    panes: HashMap<&'a str, &'a ClientShellPane>,
+    workspaces: HashMap<&'a str, &'a ClientShellWorkspace>,
+    tabs: HashMap<&'a str, &'a ClientShellTab>,
+}
+
+impl<'a> NavigatorEndpointIndex<'a> {
+    fn new(snapshot: &'a ClientShellSnapshot) -> Self {
+        Self {
+            panes: snapshot
+                .panes
+                .iter()
+                .map(|pane| (pane.pane_id.as_str(), pane))
+                .collect(),
+            workspaces: snapshot
+                .workspaces
+                .iter()
+                .map(|workspace| (workspace.workspace_id.as_str(), workspace))
+                .collect(),
+            tabs: snapshot
+                .tabs
+                .iter()
+                .map(|tab| (tab.tab_id.as_str(), tab))
+                .collect(),
+        }
+    }
 }
 
 pub(super) fn navigator_selected_index(

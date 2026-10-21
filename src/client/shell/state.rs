@@ -332,6 +332,34 @@ pub(super) enum ClientNavigatorFilter {
     Done,
 }
 
+impl ClientNavigatorFilter {
+    pub(super) fn matches(filter: Option<Self>, status: crate::api::schema::AgentStatus) -> bool {
+        use crate::api::schema::AgentStatus;
+        match filter {
+            Some(Self::Blocked) => status == AgentStatus::Blocked,
+            Some(Self::Working) => status == AgentStatus::Working,
+            Some(Self::Idle) => status == AgentStatus::Idle,
+            Some(Self::Done) => status == AgentStatus::Done,
+            None => true,
+        }
+    }
+
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Blocked => "blocked",
+            Self::Working => "working",
+            Self::Idle => "idle",
+            Self::Done => "done",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ClientNavigatorMode {
+    Tree,
+    AgentPicker,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum ClientNavigatorTarget {
     Machine {
@@ -367,6 +395,7 @@ pub(super) struct ClientNavigatorOverlay {
     pub(super) selected: Option<ClientNavigatorTarget>,
     pub(super) scroll: usize,
     pub(super) filter: Option<ClientNavigatorFilter>,
+    pub(super) mode: ClientNavigatorMode,
 }
 
 #[derive(Debug)]
